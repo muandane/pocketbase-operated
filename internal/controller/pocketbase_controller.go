@@ -28,12 +28,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	baasv1 "pb.simplified/controller/api/v1"
 )
@@ -58,6 +54,7 @@ func labelsForPocketbase(pb *baasv1.Pocketbase) map[string]string {
 // +kubebuilder:rbac:groups=baas.pb.simplified,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=baas.pb.simplified,resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=baas.pb.simplified,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=baas.pb.simplified,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=baas.pb.simplified,resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=baas.pb.simplified,resources=pocketbases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=baas.pb.simplified,resources=pocketbases/status,verbs=get;update;patch
@@ -74,65 +71,101 @@ func labelsForPocketbase(pb *baasv1.Pocketbase) map[string]string {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.20.0/pkg/reconcile
 func (r *PocketbaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	logger.Info("Reconciling PocketBase instance", "namespace", req.Namespace, "name", req.Name)
 
-	logger.Info("Starting reconciliation for Pocketbase", "namespace", req.Namespace, "name", req.Name)
-
-	// Fetch Pocketbase instance
 	pb := &baasv1.Pocketbase{}
 	if err := r.Get(ctx, req.NamespacedName, pb); err != nil {
 		if errors.IsNotFound(err) {
-			logger.Info("Pocketbase resource not found. Ignoring since object must be deleted", "namespace", req.Namespace, "name", req.Name)
+			logger.Info("PocketBase resource not found. Ignoring since object must be deleted.")
 			return ctrl.Result{}, nil
 		}
-		logger.Error(err, "Failed to fetch Pocketbase resource", "namespace", req.Namespace, "name", req.Name)
+		logger.Error(err, "Failed to get PocketBase resource")
 		return ctrl.Result{}, err
 	}
-	logger.Info("Fetched Pocketbase resource", "namespace", req.Namespace, "name", req.Name, "spec", pb.Spec)
 
-	// Create or update StatefulSet
-	config := &corev1.ConfigMap{}
-	err := r.Get(ctx, client.ObjectKey{
-		Namespace: pb.Namespace,
-		Name:      pb.Name + "-config",
-	}, config)
-
-	if err != nil {
-		if errors.IsNotFound(err) {
-			config = &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      pb.Name + "-config",
-					Namespace: pb.Namespace,
-					Labels:    labelsForPocketbase(pb),
-				},
-			}
-			if err := r.Create(ctx, config); err != nil {
-				logger.Error(err, "Failed to create ConfigMap")
-				return ctrl.Result{}, err
-			}
-			logger.Info("Created ConfigMap successfully")
-		} else {
-			logger.Error(err, "Failed to get ConfigMap")
-			return ctrl.Result{}, err
-		}
-	} else {
-		// ConfigMap exists, update it if needed
-		config.Labels = labelsForPocketbase(pb)
-		if err := r.Update(ctx, config); err != nil {
-			logger.Error(err, "Failed to update ConfigMap")
-			return ctrl.Result{}, err
-		}
-		logger.Info("Updated ConfigMap successfully")
-	}
-
-	sts := &appsv1.StatefulSet{
+	// Create PVC
+	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pb.Name,
 			Namespace: pb.Namespace,
 			Labels:    labelsForPocketbase(pb),
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(pb, baasv1.GroupVersion.WithKind("Pocketbase")),
+			},
 		},
-		Spec: appsv1.StatefulSetSpec{
-			ServiceName: pb.Name,
-			Replicas:    ptr.To[int32](1),
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: &pb.Spec.Volumes.StorageClassName,
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.PersistentVolumeAccessMode(pb.Spec.Volumes.AccessModes[0])},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse(pb.Spec.Volumes.StorageSize),
+				},
+			},
+		},
+	}
+	if err := r.Create(ctx, pvc); err != nil && !errors.IsAlreadyExists(err) {
+		logger.Error(err, "Failed to create PVC")
+		return ctrl.Result{}, err
+	}
+	logger.Info("PVC created successfully")
+
+	// Create ConfigMap
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pb.Name + "-config",
+			Namespace: pb.Namespace,
+			Labels:    labelsForPocketbase(pb),
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(pb, baasv1.GroupVersion.WithKind("Pocketbase")),
+			},
+		},
+		Data: map[string]string{}, // Add your config data here
+	}
+	if err := r.Create(ctx, cm); err != nil && !errors.IsAlreadyExists(err) {
+		logger.Error(err, "Failed to create ConfigMap")
+		return ctrl.Result{}, err
+	}
+	logger.Info("ConfigMap created successfully")
+
+	// Create Service
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pb.Name,
+			Namespace: pb.Namespace,
+			Labels:    labelsForPocketbase(pb),
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(pb, baasv1.GroupVersion.WithKind("Pocketbase")),
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{
+				Port:       8090,
+				TargetPort: intstr.FromString("http"),
+				Protocol:   corev1.ProtocolTCP,
+				Name:       "http",
+			}},
+			Selector: labelsForPocketbase(pb),
+			Type:     corev1.ServiceTypeClusterIP,
+		},
+	}
+	if err := r.Create(ctx, svc); err != nil && !errors.IsAlreadyExists(err) {
+		logger.Error(err, "Failed to create Service")
+		return ctrl.Result{}, err
+	}
+	logger.Info("Service created successfully")
+
+	// Create Deployment
+	deploy := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pb.Name,
+			Namespace: pb.Namespace,
+			Labels:    labelsForPocketbase(pb),
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(pb, baasv1.GroupVersion.WithKind("Pocketbase")),
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labelsForPocketbase(pb),
 			},
@@ -145,152 +178,73 @@ func (r *PocketbaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 						RunAsUser:  ptr.To[int64](0),
 						RunAsGroup: ptr.To[int64](0),
 					},
-					Containers: []corev1.Container{
-						{
-							Name:  "pocketbase",
-							Image: pb.Spec.Image,
-							SecurityContext: &corev1.SecurityContext{
-								Privileged: ptr.To[bool](true),
-							},
-							Ports: []corev1.ContainerPort{
-								{
-									Name:          "http",
-									ContainerPort: 8090,
-									Protocol:      corev1.ProtocolTCP,
-								},
-							},
-							LivenessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									HTTPGet: &corev1.HTTPGetAction{
-										Path: "/api/health",
-										Port: intstr.FromString("http"),
-									},
-								},
-							},
-							ReadinessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									HTTPGet: &corev1.HTTPGetAction{
-										Path: "/api/health",
-										Port: intstr.FromString("http"),
-									},
-								},
-							},
-							Resources: pb.Spec.Resources,
-							EnvFrom: []corev1.EnvFromSource{
-								{
-									ConfigMapRef: &corev1.ConfigMapEnvSource{
-										LocalObjectReference: corev1.LocalObjectReference{
-											Name: pb.Name + "-config",
-										},
-									},
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      pb.Spec.Volumes.VolumeName,
-									MountPath: pb.Spec.Volumes.VolumeMountPath,
+					Containers: []corev1.Container{{
+						Name:  "pocketbase",
+						Image: pb.Spec.Image,
+						SecurityContext: &corev1.SecurityContext{
+							Privileged: ptr.To[bool](true),
+						},
+						Ports: []corev1.ContainerPort{{
+							Name:          "http",
+							ContainerPort: 8090,
+							Protocol:      corev1.ProtocolTCP,
+						}},
+						LivenessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path: "/api/health",
+									Port: intstr.FromString("http"),
 								},
 							},
 						},
-					},
-				},
-			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				{
-					ObjectMeta: metav1.ObjectMeta{
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path: "/api/health",
+									Port: intstr.FromString("http"),
+								},
+							},
+						},
+						Resources: pb.Spec.Resources,
+						EnvFrom: []corev1.EnvFromSource{{
+							ConfigMapRef: &corev1.ConfigMapEnvSource{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: pb.Name + "-config",
+								},
+							},
+						}},
+						VolumeMounts: []corev1.VolumeMount{{
+							Name:      pb.Spec.Volumes.VolumeName,
+							MountPath: pb.Spec.Volumes.VolumeMountPath,
+						}},
+					}},
+					Volumes: []corev1.Volume{{
 						Name: pb.Spec.Volumes.VolumeName,
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						StorageClassName: &pb.Spec.Volumes.StorageClassName,
-						AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.PersistentVolumeAccessMode(pb.Spec.Volumes.AccessModes[0])},
-						Resources: corev1.VolumeResourceRequirements{
-							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse(pb.Spec.Volumes.StorageSize),
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pb.Name,
 							},
 						},
-					},
+					}},
 				},
 			},
 		},
 	}
-
-	// Set controller reference
-	if err := ctrl.SetControllerReference(pb, sts, r.Scheme); err != nil {
-		logger.Error(err, "Failed to set controller reference for StatefulSet", "namespace", sts.Namespace, "name", sts.Name)
+	if err := r.Create(ctx, deploy); err != nil && !errors.IsAlreadyExists(err) {
+		logger.Error(err, "Failed to create Deployment")
 		return ctrl.Result{}, err
 	}
-	logger.Info("Set controller reference for StatefulSet", "namespace", sts.Namespace, "name", sts.Name)
+	logger.Info("Deployment created successfully")
 
-	// Create or update StatefulSet
-	if err := r.Create(ctx, sts); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			logger.Error(err, "Failed to create StatefulSet", "namespace", sts.Namespace, "name", sts.Name)
-			return ctrl.Result{}, err
-		}
-		// Update if already exists
-		logger.Info("StatefulSet already exists, updating it", "namespace", sts.Namespace, "name", sts.Name)
-		if err := r.Update(ctx, sts); err != nil {
-			logger.Error(err, "Failed to update StatefulSet", "namespace", sts.Namespace, "name", sts.Name)
-			return ctrl.Result{}, err
-		}
-		logger.Info("Updated StatefulSet", "namespace", sts.Namespace, "name", sts.Name)
-	} else {
-		logger.Info("Created StatefulSet", "namespace", sts.Namespace, "name", sts.Name)
-	}
-
-	logger.Info("Reconciliation completed successfully", "namespace", req.Namespace, "name", req.Name)
 	return ctrl.Result{}, nil
-}
-
-func (r *PocketbaseReconciler) HandlePodEvents(obj client.Object) []reconcile.Request {
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		return []reconcile.Request{}
-	}
-
-	// Get owner references to find the Pocketbase instance that owns this pod
-	for _, ownerRef := range pod.GetOwnerReferences() {
-		if ownerRef.Kind == "Pocketbase" {
-			return []reconcile.Request{
-				{
-					NamespacedName: client.ObjectKey{
-						Namespace: pod.GetNamespace(),
-						Name:      ownerRef.Name,
-					},
-				},
-			}
-		}
-	}
-
-	// If no owner reference found, check labels as fallback
-	if pod.GetLabels()["app.kubernetes.io/instance"] == "pocketbase" {
-		// Get the Pocketbase name from labels
-		if pbName, ok := pod.GetLabels()["app.kubernetes.io/name"]; ok {
-			return []reconcile.Request{
-				{
-					NamespacedName: client.ObjectKey{
-						Namespace: pod.GetNamespace(),
-						Name:      pbName,
-					},
-				},
-			}
-		}
-	}
-
-	return []reconcile.Request{}
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *PocketbaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&baasv1.Pocketbase{}).
-		Watches(
-			&corev1.Pod{},
-			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-				return r.HandlePodEvents(obj)
-			}),
-			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
-		).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 	// Named("pocketbase").
 }
